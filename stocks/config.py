@@ -1,0 +1,7 @@
+#From config.py file
+SYMBOL = 'SPY'
+POSITION_SIZE_PCT = 0.10
+TRAILING_STOP_PCT = 0.015
+MAX_TRADES_PER_DAY = 100
+DAILY_LOSS_LIMIT = 1000  # in USD
+COOLDOWN = 20  # Cool down is 20 minutes
