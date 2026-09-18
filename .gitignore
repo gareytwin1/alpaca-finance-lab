@@ -192,3 +192,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Trading bot runtime state (never commit account data)
+*.db
+*.db-wal
+*.db-shm
+position.json
+trade_log.csv
+app.log

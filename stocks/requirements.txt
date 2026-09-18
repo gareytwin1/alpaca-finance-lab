@@ -1,0 +1,5 @@
+# Trading bot + dashboard
+alpaca-py>=0.40.0      # official Alpaca SDK (replaces the EOL alpaca-trade-api)
+pandas>=2.0
+numpy>=1.24
+flask>=3.0             # dashboard only
