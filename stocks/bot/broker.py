@@ -7,6 +7,7 @@ of the codebase never imports the SDK directly and stays easy to test.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -219,12 +220,40 @@ class Broker:
 
     # -- fills -------------------------------------------------------------
 
+    #: Order states that mean the order is done and fully executed.
+    FILLED = frozenset({"filled"})
+    #: Terminal states where no shares will trade from this order.
+    DEAD = frozenset({"canceled", "cancelled", "expired", "rejected",
+                      "done_for_day", "suspended"})
+
+    @classmethod
+    def is_working(cls, status: str) -> bool:
+        """True while an order may still execute (new, accepted, partial...).
+
+        Anything not known to be filled or dead counts as working, so an
+        unfamiliar status never licenses a second order.
+        """
+        s = status.lower()
+        return s not in cls.FILLED and s not in cls.DEAD
+
     def get_order(self, order_id: str) -> dict | None:
+        """The order, or None only when Alpaca says it does not exist (404).
+
+        Every other failure — 401, 429, 5xx, a timeout — is re-raised. An
+        unreadable order is not an absent order, and the caller must not be
+        able to confuse the two.
+        """
         try:
             o = self.trading.get_order_by_id(order_id)
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                log.warning("Order %s does not exist (404).", order_id)
+                return None
+            log.error("Order %s status unreadable (%s).", order_id, exc)
+            raise
         except Exception as exc:
-            log.warning("Could not read order %s: %s", order_id, exc)
-            return None
+            log.error("Order %s status unreadable (%s).", order_id, exc)
+            raise
         return {
             "id": str(o.id),
             "status": str(getattr(o.status, "value", o.status)),
@@ -234,15 +263,36 @@ class Broker:
 
     def wait_for_fill(self, order_id: str, timeout: float = 20.0,
                       interval: float = 1.0) -> dict | None:
-        """Polls until the order reaches a terminal state or `timeout` passes."""
-        import time
+        """Polls until the order settles or `timeout` elapses.
 
-        terminal = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        Returns the last successfully read order — which on timeout may still
+        be working or partially filled, so callers must check `status`
+        themselves rather than assuming a fill.
+
+        Returns None only for a 404. Transient read errors are retried until
+        the deadline; if the most recent read still failed, the exception is
+        raised so an unreachable broker is never reported as an outcome.
+        """
         deadline = time.monotonic() + timeout
-        order = self.get_order(order_id)
-        while time.monotonic() < deadline:
-            if order and order["status"].lower() in terminal:
-                return order
+        order: dict | None = None
+        last_exc: Exception | None = None
+
+        while True:
+            try:
+                order = self.get_order(order_id)
+                last_exc = None
+                if order is None:
+                    return None
+                if not self.is_working(order["status"]):
+                    return order
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Retrying status read for order %s: %s", order_id, exc)
+
+            if time.monotonic() >= deadline:
+                break
             time.sleep(interval)
-            order = self.get_order(order_id)
+
+        if last_exc is not None:
+            raise last_exc
         return order

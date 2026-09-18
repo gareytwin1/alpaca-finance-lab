@@ -11,11 +11,15 @@ Run it with::
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
+import os
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Iterator
 
 from . import storage
 from .broker import Broker
@@ -35,6 +39,34 @@ def setup_logging(cfg: Settings, verbose: bool = False) -> None:
     )
     logging.getLogger("alpaca").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+@contextmanager
+def single_instance(cfg: Settings) -> Iterator[None]:
+    """Holds an exclusive lock for as long as this process may trade.
+
+    Two runners against one account both read "no close order is working",
+    both submit one, and the second write of `pending_exit` hides the first
+    order entirely. SQLite serializes each statement but not the read, the
+    broker call and the write as a unit, so the guard has to live out here.
+    """
+    lock_path = f"{cfg.db_path}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise RuntimeError(
+            f"another bot process is already running against {cfg.db_path} "
+            f"(lock: {lock_path})"
+        )
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class TradingBot:
@@ -70,23 +102,95 @@ class TradingBot:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return storage.count_trades_on(today, path=self.cfg.db_path)
 
+    # -- partial exits ----------------------------------------------------
+
+    def _exit_fills(self, trade_id: int) -> list[dict]:
+        """Shares already sold by earlier close orders for this trade."""
+        record = storage.get_state("exit_fills", path=self.cfg.db_path) or {}
+        if record.get("trade_id") != trade_id:
+            return []
+        return [f for f in record.get("fills") or []
+                if f.get("qty") and f.get("price")]
+
+    def _record_partial_fill(self, trade_id: int, order: dict) -> None:
+        """Saves a dying order's executions before its id is thrown away.
+
+        A close order can be canceled or expire after filling part of the
+        position. Those shares are gone at the broker, so losing them here
+        would price the whole trade off whatever the replacement order fills
+        at, silently misstating realized P&L.
+        """
+        qty = order.get("filled_qty") or 0
+        price = order.get("filled_avg_price")
+        if not qty or not price:
+            return
+        fills = self._exit_fills(trade_id)
+        if any(f.get("order_id") == order["id"] for f in fills):
+            return
+        fills.append({"order_id": order["id"], "qty": qty, "price": price})
+        self._state("exit_fills", {"trade_id": trade_id, "fills": fills})
+        self._note("warning",
+                   f"Trade #{trade_id}: order {order['id']} filled {qty:g} @ "
+                   f"{price:.2f} before it died; carrying that into the exit.")
+
+    def _aggregate_exit(self, trade_id: int, qty: float,
+                        price: float) -> tuple[float, float]:
+        """Blends earlier partial exits with a final fill into one average."""
+        fills = self._exit_fills(trade_id) + [{"qty": qty, "price": price}]
+        total = sum(f["qty"] for f in fills)
+        if total <= 0:
+            return price, 0.0
+        return sum(f["qty"] * f["price"] for f in fills) / total, total
+
     # -- reconciliation --------------------------------------------------
 
     def reconcile(self, broker_pos: dict | None, db_trade: dict | None,
                   price: float | None) -> tuple[dict | None, str | None]:
         """Aligns our books with the broker's.
 
-        Returns the trade we may manage plus a note about anything odd.
-        A position the bot did not open is never touched.
+        Returns the trade we may manage plus a note about anything odd. A
+        position the bot did not open is never touched, and one whose size or
+        side disagrees with the ledger is reported rather than managed.
         """
         if db_trade and not broker_pos:
-            # Someone (or a stop) closed it behind our back.
-            exit_price = price or db_trade["entry_price"]
-            storage.close_trade(db_trade["id"], exit_price,
-                                "closed outside the bot", path=self.cfg.db_path)
+            # The position is gone. If our own close order is what filled,
+            # book its actual fill price rather than the last trade price.
+            trade_id = db_trade["id"]
+            pending = storage.get_state("pending_exit", path=self.cfg.db_path) or {}
+            if pending.get("trade_id") == trade_id and pending.get("order_id"):
+                try:
+                    order = self.broker.get_order(pending["order_id"])
+                except Exception as exc:
+                    # Cannot tell whose fill this was; leave the trade open
+                    # rather than booking a guessed price.
+                    self._note("warning",
+                               f"Trade #{trade_id}: position is gone but "
+                               f"close order {pending['order_id']} is unreadable "
+                               f"({exc}). Leaving the trade open.")
+                    return None, "exit outcome unknown"
+                if order and order["status"].lower() in self.broker.FILLED \
+                        and order.get("filled_avg_price"):
+                    booked = self._book_exit(
+                        db_trade, order,
+                        pending.get("reason") or "closed at the broker")
+                    if booked["action"] != "sell":
+                        return None, "exit outcome unknown"
+                    return None, "orphaned trade reconciled"
+
+            # Nobody can say what the remaining shares fetched, so the last
+            # trade price is a guess; any confirmed partials still count.
+            exited = sum(f["qty"] for f in self._exit_fills(trade_id))
+            remaining = max(db_trade["qty"] - exited, 0.0)
+            exit_price, exit_qty = self._aggregate_exit(
+                trade_id, remaining, price or db_trade["entry_price"])
+            storage.close_trade(trade_id, exit_price, "closed outside the bot",
+                                path=self.cfg.db_path,
+                                exit_qty=exit_qty or None)
+            self._state("pending_exit", None)
+            self._state("exit_fills", None)
             self._state("last_exit", storage.utcnow())
             self._note("warning",
-                       f"Trade #{db_trade['id']} was closed outside the bot; "
+                       f"Trade #{trade_id} was closed outside the bot; "
                        f"booked at {exit_price:.2f}.")
             return None, "orphaned trade reconciled"
 
@@ -99,8 +203,60 @@ class TradingBot:
             self._state("untracked_position", note)
             return None, note
 
+        if broker_pos and db_trade:
+            mismatch = self._position_mismatch(broker_pos, db_trade)
+            known = storage.get_state("position_mismatch", path=self.cfg.db_path)
+            if mismatch:
+                # Every cycle re-detects the same mismatch; log it once.
+                if mismatch != known:
+                    self._note("error", mismatch)
+                self._state("position_mismatch", mismatch)
+                return None, mismatch
+            if known:
+                self._note("info", f"Trade #{db_trade['id']} matches the broker "
+                                   f"again; resuming management.")
+            self._state("position_mismatch", None)
+
         self._state("untracked_position", None)
         return db_trade, None
+
+    def _position_mismatch(self, broker_pos: dict, db_trade: dict) -> str | None:
+        """Why the live position cannot be managed as this trade, if so.
+
+        Closing is all-or-nothing at the broker, so a position that is bigger,
+        smaller or the other way round than the ledger says is not something
+        long-only exit logic may act on: it would sell shares the bot does not
+        own or price a close against the wrong share count.
+        """
+        trade_id = db_trade["id"]
+        if broker_pos["side"] != db_trade["side"]:
+            return (f"Broker holds a {broker_pos['side']} position in "
+                    f"{broker_pos['symbol']} but trade #{trade_id} is "
+                    f"{db_trade['side']}. This bot is long-only and will not "
+                    f"manage a side it did not open; resolve it manually.")
+
+        exited = sum(f["qty"] for f in self._exit_fills(trade_id))
+        expected = db_trade["qty"] - exited
+        difference = broker_pos["qty"] - expected
+        if abs(difference) < 1e-6:
+            return None
+
+        if difference > 0:
+            return (f"Broker holds {broker_pos['qty']:g} "
+                    f"{broker_pos['symbol']} but trade #{trade_id} accounts "
+                    f"for {expected:g}. Closing would liquidate "
+                    f"{difference:g} shares the bot does not own; the bot "
+                    f"will not trade this symbol until it is resolved.")
+
+        pending = storage.get_state("pending_exit", path=self.cfg.db_path) or {}
+        if pending.get("trade_id") == trade_id and pending.get("order_id"):
+            # A close order is working; a shrinking position is what it does.
+            return None
+
+        return (f"Broker holds {broker_pos['qty']:g} {broker_pos['symbol']} "
+                f"but trade #{trade_id} expects {expected:g} and no close "
+                f"order is working. Something sold behind the bot; it will "
+                f"not trade this symbol until it is resolved.")
 
     def adopt_position(self) -> dict | None:
         """Takes an existing broker position under bot management."""
@@ -247,9 +403,21 @@ class TradingBot:
             self._note("error", f"Buy order rejected: {exc}")
             return {"action": "error", "reason": str(exc)}
 
-        fill = self.broker.wait_for_fill(order["id"])
+        try:
+            fill = self.broker.wait_for_fill(order["id"])
+        except Exception as exc:
+            # The buy is already at the broker. Do not record a trade we
+            # cannot price, and do not assume it failed: if it filled, the
+            # untracked-position guard catches it on the next cycle.
+            self._note("error",
+                       f"Buy order {order['id']} submitted but its status is "
+                       f"unreadable ({exc}). Not recording a trade; if it "
+                       f"filled it will surface as an untracked position.")
+            return {"action": "entry-unconfirmed", "order_id": order["id"],
+                    "reason": f"status lookup failed: {exc}"}
+
         if not fill or fill["status"].lower() != "filled":
-            status = fill["status"] if fill else "unknown"
+            status = fill["status"] if fill else "missing"
             self._note("warning", f"Buy order {order['id']} did not fill (status {status}).")
             return {"action": "unfilled", "reason": f"order status {status}"}
 
@@ -262,28 +430,145 @@ class TradingBot:
         return {"action": "buy", "reason": reason, "qty": fill["filled_qty"],
                 "fill_price": entry_price, "trade_id": trade_id}
 
-    def _exit(self, db_trade: dict, reason: str, price: float) -> dict:
+    def _book_exit(self, db_trade: dict, order: dict, reason: str) -> dict:
+        """Records a confirmed fill. The only path that closes a ledger trade."""
         cfg = self.cfg
-        if cfg.dry_run:
-            self._note("info", f"[DRY RUN] would SELL trade #{db_trade['id']} @ ~{price:.2f} ({reason})")
-            return {"action": "dry-run-sell", "reason": reason}
+        trade_id = db_trade["id"]
+        exit_price = order.get("filled_avg_price")
+        if not exit_price:
+            # "filled" with no average price should not happen; refuse to
+            # invent one rather than book a fabricated P&L.
+            self._note("error",
+                       f"Exit for #{trade_id}: order {order['id']} reports "
+                       f"filled but carries no fill price. Trade stays open.")
+            return {"action": "exit-unconfirmed", "trade_id": trade_id,
+                    "order_id": order["id"],
+                    "reason": "filled order had no average price"}
 
-        self.broker.cancel_open_orders(cfg.symbol)
-        result = self.broker.close_position(cfg.symbol)
-        if not result:
-            self._note("error", f"Could not close trade #{db_trade['id']}; will retry next cycle.")
-            return {"action": "error", "reason": "close_position failed"}
+        prior = self._exit_fills(trade_id)
+        final_qty = order.get("filled_qty") or 0
+        if prior and not final_qty:
+            self._note("error",
+                       f"Exit for #{trade_id}: order {order['id']} reports "
+                       f"filled but carries no quantity, and {len(prior)} "
+                       f"earlier fill(s) must be weighted against it. "
+                       f"Trade stays open.")
+            return {"action": "exit-unconfirmed", "trade_id": trade_id,
+                    "order_id": order["id"],
+                    "reason": "filled order had no quantity to weight"}
 
-        fill = self.broker.wait_for_fill(result["id"])
-        exit_price = (fill or {}).get("filled_avg_price") or price
-        closed = storage.close_trade(db_trade["id"], exit_price, reason, path=cfg.db_path)
+        exit_qty = None
+        if prior:
+            exit_price, exit_qty = self._aggregate_exit(trade_id, final_qty,
+                                                        exit_price)
+
+        closed = storage.close_trade(trade_id, exit_price, reason,
+                                     path=cfg.db_path, exit_qty=exit_qty)
+        self._state("pending_exit", None)
+        self._state("exit_fills", None)
         self._state("last_exit", storage.utcnow())
         pnl = (closed or {}).get("pnl", 0.0) or 0.0
         self._note("info",
                    f"EXIT #{db_trade['id']} @ {exit_price:.2f} — {reason} | "
-                   f"P&L {pnl:+.2f}")
+                   f"P&L {pnl:+.2f} | order {order['id']}")
         return {"action": "sell", "reason": reason, "fill_price": exit_price,
-                "pnl": pnl, "trade_id": db_trade["id"]}
+                "pnl": pnl, "trade_id": db_trade["id"], "order_id": order["id"]}
+
+    def _unconfirmed(self, db_trade: dict, order_id: str, status: str,
+                     detail: str) -> dict:
+        """Leaves the trade open and says exactly what is unresolved."""
+        self._note("warning",
+                   f"Exit for #{db_trade['id']} NOT confirmed: order {order_id} "
+                   f"last status {status!r} ({detail}). Ledger trade stays open; "
+                   f"retrying next cycle.")
+        return {"action": "exit-unconfirmed", "trade_id": db_trade["id"],
+                "order_id": order_id, "status": status, "reason": detail}
+
+    def _exit(self, db_trade: dict, reason: str, price: float) -> dict:
+        """Closes a position, booking it only once the broker confirms a fill.
+
+        An exit is a two-phase thing: an order is submitted, and separately it
+        settles. The ledger follows the second phase, never the first, so a
+        timeout or an outage leaves the trade open and retryable instead of
+        recording an exit that did not happen.
+        """
+        cfg = self.cfg
+        trade_id = db_trade["id"]
+
+        if cfg.dry_run:
+            self._note("info", f"[DRY RUN] would SELL trade #{trade_id} @ ~{price:.2f} ({reason})")
+            return {"action": "dry-run-sell", "reason": reason}
+
+        # --- phase 1: is a close order for this trade already working? -----
+        pending = storage.get_state("pending_exit", path=cfg.db_path) or {}
+        if pending.get("trade_id") == trade_id and pending.get("order_id"):
+            order_id = pending["order_id"]
+            reason = pending.get("reason") or reason
+            try:
+                order = self.broker.get_order(order_id)
+            except Exception as exc:
+                return self._unconfirmed(db_trade, order_id, "unreadable",
+                                         f"status lookup failed: {exc}")
+
+            if order is None:
+                self._note("warning",
+                           f"Exit for #{trade_id}: order {order_id} no longer "
+                           f"exists (404); submitting a replacement.")
+                self._state("pending_exit", None)
+            elif order["status"].lower() in self.broker.FILLED:
+                return self._book_exit(db_trade, order, reason)
+            elif self.broker.is_working(order["status"]):
+                # Still live at the broker. A second close here would
+                # oversell, so wait for this one instead.
+                self._note("info",
+                           f"Exit for #{trade_id}: order {order_id} still "
+                           f"{order['status']!r}; not sending another.")
+                return {"action": "exit-pending", "trade_id": trade_id,
+                        "order_id": order_id, "status": order["status"],
+                        "reason": f"close order {order['status']}"}
+            else:
+                self._record_partial_fill(trade_id, order)
+                done = order.get("filled_qty") or 0
+                self._note("warning",
+                           f"Exit for #{trade_id}: order {order_id} ended "
+                           f"{order['status']!r} after filling {done:g}/"
+                           f"{db_trade['qty']:g}; resubmitting for the rest.")
+                self._state("pending_exit", None)
+
+        # --- phase 2: submit a close ----------------------------------------
+        self.broker.cancel_open_orders(cfg.symbol)
+        result = self.broker.close_position(cfg.symbol)
+        if not result:
+            self._note("error",
+                       f"Could not submit close for #{trade_id}; ledger trade "
+                       f"stays open, retrying next cycle.")
+            return {"action": "error", "reason": "close_position failed",
+                    "trade_id": trade_id}
+
+        order_id = result["id"]
+        # Persist before waiting: a crash mid-wait must not lose the order id.
+        self._state("pending_exit", {"trade_id": trade_id, "order_id": order_id,
+                                     "reason": reason,
+                                     "submitted_at": storage.utcnow()})
+
+        # --- phase 3: confirm ------------------------------------------------
+        try:
+            order = self.broker.wait_for_fill(order_id)
+        except Exception as exc:
+            return self._unconfirmed(db_trade, order_id, "unreadable",
+                                     f"status lookup failed: {exc}")
+
+        if order is None:
+            return self._unconfirmed(db_trade, order_id, "missing",
+                                     "order vanished after submission")
+        if order["status"].lower() in self.broker.FILLED:
+            return self._book_exit(db_trade, order, reason)
+
+        filled = order.get("filled_qty") or 0
+        detail = ("partially filled "
+                  f"{filled:g}/{db_trade['qty']:g}" if filled
+                  else "did not fill before the confirmation timeout")
+        return self._unconfirmed(db_trade, order_id, order["status"], detail)
 
     # -- loop -------------------------------------------------------------
 
@@ -348,9 +633,10 @@ def _print_status(bot: TradingBot) -> None:
           f"{trade['entry_price']:.2f}" if trade else "  Bot trade   none")
     print(f"  Trades today {bot._trades_today()}/{cfg.max_trades_per_day}"
           f"   cooldown {bot._cooldown_remaining()}s")
-    untracked = storage.get_state("untracked_position", path=cfg.db_path)
-    if untracked:
-        print(f"\n  ⚠  {untracked}")
+    for key in ("untracked_position", "position_mismatch"):
+        warning = storage.get_state(key, path=cfg.db_path)
+        if warning:
+            print(f"\n  ⚠  {warning}")
     print()
 
 
@@ -392,27 +678,32 @@ def main(argv: list[str] | None = None) -> int:
         _print_status(bot)
         return 0
 
-    if args.adopt:
-        bot.adopt_position()
-        _print_status(bot)
-        return 0
+    try:
+        with single_instance(cfg):
+            if args.adopt:
+                bot.adopt_position()
+                _print_status(bot)
+                return 0
 
-    if args.close:
-        trade = storage.get_open_trade(path=cfg.db_path)
-        if not trade:
-            log.info("No tracked trade to close.")
-            return 0
-        price = bot.broker.latest_price(cfg.symbol) or trade["entry_price"]
-        bot._exit(trade, "manual close", price)
-        return 0
+            if args.close:
+                trade = storage.get_open_trade(path=cfg.db_path)
+                if not trade:
+                    log.info("No tracked trade to close.")
+                    return 0
+                price = bot.broker.latest_price(cfg.symbol) or trade["entry_price"]
+                bot._exit(trade, "manual close", price)
+                return 0
 
-    if args.once:
-        cycle = bot.run_once()
-        storage.set_state("heartbeat", storage.utcnow(), path=cfg.db_path)
-        log.info("cycle: %s — %s", cycle.get("action"), cycle.get("reason"))
-        return 0
+            if args.once:
+                cycle = bot.run_once()
+                storage.set_state("heartbeat", storage.utcnow(), path=cfg.db_path)
+                log.info("cycle: %s — %s", cycle.get("action"), cycle.get("reason"))
+                return 0
 
-    bot.run_forever()
+            bot.run_forever()
+    except RuntimeError as exc:
+        log.error("Refusing to start: %s", exc)
+        return 2
     return 0
 
 

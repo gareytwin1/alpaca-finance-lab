@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_time     TEXT,
     exit_price    REAL,
     exit_reason   TEXT,
+    exit_qty      REAL,
     pnl           REAL,
     pnl_pct       REAL,
     high_water    REAL,
@@ -84,6 +85,14 @@ def connect(path: str | None = None, readonly: bool = False) -> Iterator[sqlite3
 def init_db(path: str | None = None) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Brings a database created by an older version up to date."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+    if "exit_qty" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN exit_qty REAL")
 
 
 # --------------------------------------------------------------------------
@@ -167,22 +176,35 @@ def close_trade(
     exit_reason: str = "",
     exit_time: str | None = None,
     path: str | None = None,
+    exit_qty: float | None = None,
 ) -> dict | None:
-    """Closes a trade and computes its realized P&L. Returns the closed row."""
+    """Closes a trade and computes its realized P&L. Returns the closed row.
+
+    `exit_price` is the average across every fill that closed the position and
+    `exit_qty` the shares those fills covered; P&L follows the shares that
+    actually traded, not the quantity the position was opened with.
+
+    Idempotent: a trade that is already closed is returned untouched, so a
+    retried or duplicated exit can never overwrite a recorded fill price.
+    """
     with connect(path) as conn:
         row = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
         if row is None:
             return None
+        if row["status"] != "open":
+            return dict(row)
+        qty = row["qty"] if exit_qty is None else exit_qty
         direction = 1 if row["side"] == "long" else -1
-        pnl = (exit_price - row["entry_price"]) * row["qty"] * direction
+        pnl = (exit_price - row["entry_price"]) * qty * direction
         pnl_pct = (
             (exit_price - row["entry_price"]) / row["entry_price"] * 100 * direction
             if row["entry_price"] else 0.0
         )
         conn.execute(
             "UPDATE trades SET exit_time=?, exit_price=?, exit_reason=?, "
-            "pnl=?, pnl_pct=?, status='closed' WHERE id=?",
-            (exit_time or utcnow(), exit_price, exit_reason, pnl, pnl_pct, trade_id),
+            "exit_qty=?, pnl=?, pnl_pct=?, status='closed' WHERE id=?",
+            (exit_time or utcnow(), exit_price, exit_reason, qty, pnl, pnl_pct,
+             trade_id),
         )
         closed = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
     return dict(closed) if closed else None

@@ -197,6 +197,7 @@ cython_debug/
 *.db
 *.db-wal
 *.db-shm
+*.db.lock
 position.json
 trade_log.csv
 app.log
