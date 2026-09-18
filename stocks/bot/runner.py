@@ -142,6 +142,29 @@ class TradingBot:
             return price, 0.0
         return sum(f["qty"] * f["price"] for f in fills) / total, total
 
+    # -- in-flight closes -------------------------------------------------
+
+    def _pending_exit(self, trade_id: int) -> dict:
+        """The recorded in-flight close for this trade, or an empty dict."""
+        pending = storage.get_state("pending_exit", path=self.cfg.db_path) or {}
+        if pending.get("trade_id") != trade_id:
+            return {}
+        if not (pending.get("client_order_id") or pending.get("order_id")):
+            return {}
+        return pending
+
+    def _resolve_pending(self, pending: dict) -> dict | None:
+        """The order a pending record names, by whichever id it carries.
+
+        Records written before exits carried a client id hold only an order
+        id. Resolving those the old way keeps a close that is still working
+        visible across the upgrade, instead of looking like no close at all
+        and inviting a duplicate.
+        """
+        if pending.get("client_order_id"):
+            return self.broker.get_order_by_client_id(pending["client_order_id"])
+        return self.broker.get_order(pending["order_id"])
+
     # -- reconciliation --------------------------------------------------
 
     def reconcile(self, broker_pos: dict | None, db_trade: dict | None,
@@ -156,17 +179,18 @@ class TradingBot:
             # The position is gone. If our own close order is what filled,
             # book its actual fill price rather than the last trade price.
             trade_id = db_trade["id"]
-            pending = storage.get_state("pending_exit", path=self.cfg.db_path) or {}
-            if pending.get("trade_id") == trade_id and pending.get("order_id"):
+            pending = self._pending_exit(trade_id)
+            if pending:
+                ref = pending.get("client_order_id") or pending.get("order_id")
                 try:
-                    order = self.broker.get_order(pending["order_id"])
+                    order = self._resolve_pending(pending)
                 except Exception as exc:
                     # Cannot tell whose fill this was; leave the trade open
                     # rather than booking a guessed price.
                     self._note("warning",
-                               f"Trade #{trade_id}: position is gone but "
-                               f"close order {pending['order_id']} is unreadable "
-                               f"({exc}). Leaving the trade open.")
+                               f"Trade #{trade_id}: position is gone but close "
+                               f"order {ref} is unreadable ({exc}). Leaving the "
+                               f"trade open.")
                     return None, "exit outcome unknown"
                 if order and order["status"].lower() in self.broker.FILLED \
                         and order.get("filled_avg_price"):
@@ -248,9 +272,10 @@ class TradingBot:
                     f"{difference:g} shares the bot does not own; the bot "
                     f"will not trade this symbol until it is resolved.")
 
-        pending = storage.get_state("pending_exit", path=self.cfg.db_path) or {}
-        if pending.get("trade_id") == trade_id and pending.get("order_id"):
-            # A close order is working; a shrinking position is what it does.
+        if self._pending_exit(trade_id):
+            # A close is in flight; a shrinking position is what it does. This
+            # holds for a submission whose response was lost too — the order
+            # may well exist, so its effect on the position is expected.
             return None
 
         return (f"Broker holds {broker_pos['qty']:g} {broker_pos['symbol']} "
@@ -499,56 +524,90 @@ class TradingBot:
             self._note("info", f"[DRY RUN] would SELL trade #{trade_id} @ ~{price:.2f} ({reason})")
             return {"action": "dry-run-sell", "reason": reason}
 
-        # --- phase 1: is a close order for this trade already working? -----
-        pending = storage.get_state("pending_exit", path=cfg.db_path) or {}
-        if pending.get("trade_id") == trade_id and pending.get("order_id"):
-            order_id = pending["order_id"]
+        # --- phase 1: what happened to the close we may already have sent? --
+        pending = self._pending_exit(trade_id)
+        attempt = 1
+        reuse_id = None
+        if pending:
+            attempt = pending.get("attempt") or 1
             reason = pending.get("reason") or reason
+            ref = pending.get("client_order_id") or pending["order_id"]
             try:
-                order = self.broker.get_order(order_id)
+                order = self._resolve_pending(pending)
             except Exception as exc:
-                return self._unconfirmed(db_trade, order_id, "unreadable",
+                return self._unconfirmed(db_trade, ref, "unreadable",
                                          f"status lookup failed: {exc}")
 
             if order is None:
+                # Alpaca has no such order, so the earlier submission never
+                # landed however it failed. A client id can be reused here
+                # precisely because nothing exists to collide with.
+                reuse_id = pending.get("client_order_id")
                 self._note("warning",
-                           f"Exit for #{trade_id}: order {order_id} no longer "
-                           f"exists (404); submitting a replacement.")
-                self._state("pending_exit", None)
+                           f"Exit for #{trade_id}: no order exists for {ref}; "
+                           f"the earlier submission never reached Alpaca. "
+                           f"Submitting again.")
             elif order["status"].lower() in self.broker.FILLED:
                 return self._book_exit(db_trade, order, reason)
             elif self.broker.is_working(order["status"]):
                 # Still live at the broker. A second close here would
                 # oversell, so wait for this one instead.
                 self._note("info",
-                           f"Exit for #{trade_id}: order {order_id} still "
+                           f"Exit for #{trade_id}: order {ref} still "
                            f"{order['status']!r}; not sending another.")
                 return {"action": "exit-pending", "trade_id": trade_id,
-                        "order_id": order_id, "status": order["status"],
+                        "order_id": order.get("id"),
+                        "client_order_id": pending.get("client_order_id"),
+                        "status": order["status"],
                         "reason": f"close order {order['status']}"}
             else:
                 self._record_partial_fill(trade_id, order)
                 done = order.get("filled_qty") or 0
                 self._note("warning",
-                           f"Exit for #{trade_id}: order {order_id} ended "
+                           f"Exit for #{trade_id}: order {ref} ended "
                            f"{order['status']!r} after filling {done:g}/"
                            f"{db_trade['qty']:g}; resubmitting for the rest.")
+                # A dead order keeps its id forever, so the replacement needs
+                # a new one.
+                attempt += 1
                 self._state("pending_exit", None)
 
         # --- phase 2: submit a close ----------------------------------------
+        client_order_id = reuse_id or f"bot-exit-{trade_id}-{attempt}"
+        # Persist the id BEFORE the request. If the response is lost, this is
+        # the only thread back to an order Alpaca may already have accepted.
+        self._state("pending_exit", {"trade_id": trade_id, "attempt": attempt,
+                                     "client_order_id": client_order_id,
+                                     "order_id": None, "reason": reason,
+                                     "submitted_at": storage.utcnow()})
+
         self.broker.cancel_open_orders(cfg.symbol)
-        result = self.broker.close_position(cfg.symbol)
-        if not result:
-            self._note("error",
-                       f"Could not submit close for #{trade_id}; ledger trade "
-                       f"stays open, retrying next cycle.")
-            return {"action": "error", "reason": "close_position failed",
-                    "trade_id": trade_id}
+
+        try:
+            position = self.broker.position(cfg.symbol)
+        except Exception as exc:
+            return self._unconfirmed(db_trade, client_order_id, "unreadable",
+                                     f"position lookup failed: {exc}")
+        if not position:
+            return self._unconfirmed(db_trade, client_order_id, "missing",
+                                     "broker reports no position to close")
+
+        try:
+            result = self.broker.submit_market_order(
+                cfg.symbol, "sell", position["qty"],
+                client_order_id=client_order_id)
+        except Exception as exc:
+            # Ambiguous: Alpaca may have accepted this before the response was
+            # lost. The id is already persisted, so the next cycle asks Alpaca
+            # what happened instead of guessing.
+            return self._unconfirmed(db_trade, client_order_id, "unsubmitted",
+                                     f"close submission failed ({exc}); "
+                                     f"resolving by client id next cycle")
 
         order_id = result["id"]
-        # Persist before waiting: a crash mid-wait must not lose the order id.
-        self._state("pending_exit", {"trade_id": trade_id, "order_id": order_id,
-                                     "reason": reason,
+        self._state("pending_exit", {"trade_id": trade_id, "attempt": attempt,
+                                     "client_order_id": client_order_id,
+                                     "order_id": order_id, "reason": reason,
                                      "submitted_at": storage.utcnow()})
 
         # --- phase 3: confirm ------------------------------------------------

@@ -16,6 +16,7 @@ environment variables the bot itself uses (`ALPACA_API_KEY`, etc.).
 | Position mismatch (qty/side) | **Blocks all trading on the symbol** | Investigate, resolve manually |
 | Pending exit (order in flight) | Waits, retries next cycle | Usually nothing — resolves on its own |
 | Exit unconfirmed (timeout, partial fill) | **Keeps ledger trade open**, retries next cycle | Usually nothing; check if it persists |
+| Exit submission outcome unknown | Resolves it by client order id next cycle | Nothing — automatic recovery |
 | Entry unconfirmed | Books nothing; next cycle reconciles | Usually nothing; check for an untracked position after |
 | 401 / auth failure | **Cycle fails, no trade attempted, exception logged** | Fix credentials |
 | 429 / rate limited | **Cycle fails**, retried next cycle | Usually nothing; investigate if constant |
@@ -87,7 +88,7 @@ python -m bot.runner --dry-run --once   # single cycle
 ```
 
 Evaluates signals and logs what it *would* do; never calls
-`submit_market_order` or `close_position`. Confirmed by test
+`submit_market_order`. Confirmed by test
 (`test_dry_run_never_touches_the_ledger`) — the ledger is never written to in
 this mode. Use this to sanity-check a strategy or settings change before
 trusting it with real (paper) orders.
@@ -111,7 +112,7 @@ sqlite3 trading_bot.db "SELECT ts, level, message FROM events ORDER BY id DESC L
 python -m unittest discover -s tests -v
 ```
 
-77 tests as of this writing (confirm the current count by running it — don't
+86 tests as of this writing (confirm the current count by running it — don't
 trust a stale number in a document). No credentials or network required; they
 build synthetic bars and temporary databases.
 
@@ -176,6 +177,33 @@ order takes to fill. If it's still pending after several minutes:
    long time), that's an Alpaca-side issue — decide whether to intervene
    directly in Alpaca (cancel it there) rather than fighting the bot's own
    retry logic.
+
+Every close order the bot sends carries a client order id of the form
+`bot-exit-<trade_id>-<attempt>`, which is searchable in Alpaca's order
+history. That's the fastest way to see exactly which orders the bot sent for
+a given trade, and in what order.
+
+## Handling an exit whose submission outcome is unknown
+
+**Bot behavior: automatic recovery.** If the close request fails in a way
+that leaves it unclear whether Alpaca accepted it (a lost response, a
+timeout mid-request), the bot has already persisted the client order id
+*before* sending, and reports `exit-unconfirmed` with status `unsubmitted`.
+On the next cycle it asks Alpaca what exists under that id:
+
+- **Order exists and filled** — booked normally, no duplicate sent.
+- **Order exists and is working** — the bot waits for it.
+- **Order exists but died** — any partial fill is preserved, and a
+  replacement goes out under a *new* id.
+- **No such order** — the submission genuinely never landed, so the bot
+  retries under the *same* id.
+
+You do not need to intervene for this case. If the id lookup itself keeps
+failing (broker unreachable), the bot deliberately refuses to send another
+close — the ledger trade stays open, the position is left alone, and it
+retries once Alpaca is reachable. That's a wait, not a stuck state, but if
+it persists you can search the client order id in Alpaca directly to see
+the truth for yourself.
 
 ## Handling an uncertain entry
 

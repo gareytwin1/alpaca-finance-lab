@@ -115,10 +115,12 @@ until it resolves:
    `done_for_day`, rejected, suspended) it may still have partially executed
    — see **Partial-fill accounting** below — and the bot clears `pending_exit`
    and moves to phase 2.
-2. **Submit a close.** Cancels any other open orders for the symbol, then
-   calls `close_position()`. The resulting order id is written to
-   `pending_exit` **before** the bot waits on it, so a crash mid-wait doesn't
-   lose track of the order.
+2. **Submit a close.** Mints a `client_order_id` (`bot-exit-<trade>-<attempt>`)
+   and writes it to `pending_exit` **before** sending anything, cancels any
+   other open orders for the symbol, reads the **live broker position** to
+   size the order, and submits a market sell for exactly that quantity.
+   Persisting the id first is the whole point: if the response is lost, that
+   id is the only thread back to an order Alpaca may already have accepted.
 3. **Confirm.** Polls for a fill. A trade is only closed
    (`storage.close_trade`) once a `filled` status with a real fill price
    comes back. Anything else — timeout, partial fill, an unreadable broker,
@@ -269,32 +271,30 @@ binds to localhost only; it has no authentication, so do not expose it.
 python -m unittest discover -s tests -v
 ```
 
-77 tests (verified by running the suite) covering the indicators, every entry
-and exit path, partial-fill P&L aggregation, position reconciliation
-(quantity and side mismatches), single-instance locking, database migration,
-position sizing, and the ledger's P&L arithmetic. They construct synthetic
-bars and temporary databases, so they need no credentials and no network.
+86 tests (verified by running the suite) covering the indicators, every entry
+and exit path, ambiguous-submission recovery by client order id, partial-fill
+P&L aggregation, position reconciliation (quantity and side mismatches),
+single-instance locking, database migration, position sizing, and the
+ledger's P&L arithmetic. They construct synthetic bars and temporary
+databases, so they need no credentials and no network.
 
 ## Known limitations
 
 These are gaps I could confirm in the current code, not just theoretical
 concerns — see git history / review notes for how each was verified.
 
-- **Ambiguous order submission.** `Broker.close_position()` and
-  `Broker.submit_market_order()` can raise after Alpaca has already accepted
-  the order but before the response reaches the client. The bot cannot
-  distinguish "rejected" from "accepted, response lost." For exits, the
-  fallback path can end up booking a trade at a **guessed** price rather than
-  the order's true fill price. For entries, the bot is unlikely to submit a
-  true duplicate (reconciliation catches a filled-but-unrecorded buy as an
-  untracked position on the next cycle), but it still lands in a stuck state
-  requiring `--adopt`.
-- **No `client_order_id` recovery.** Fixing the above properly means
-  generating and persisting an idempotency key *before* the network call, and
-  querying Alpaca for it on an ambiguous failure rather than guessing. This
-  has not been implemented; `close_position()`'s request type doesn't support
-  a `client_order_id` at all, so exits would need to move onto
-  `submit_market_order()` with an explicitly computed quantity.
+- **Ambiguous submission is handled for exits, but not for entries.** Exits
+  now persist a `client_order_id` before submitting and resolve it against
+  Alpaca afterwards, so a lost response no longer means a lost order (see
+  **Order lifecycle**). Entries have no equivalent: `_enter()` submits without
+  an idempotency key, so a buy accepted by Alpaca whose response is lost is
+  still only recoverable indirectly — reconciliation catches the filled
+  position as untracked on the next cycle, which prevents a duplicate buy but
+  leaves a stuck state needing `--adopt`.
+- **Exit recovery depends on Alpaca being reachable.** If the client id
+  cannot be looked up (timeout, 401, 429), the bot deliberately does nothing
+  rather than risk a duplicate close — the ledger trade stays open and the
+  position stays un-managed until the lookup succeeds.
 - **Position-mismatch gate doesn't verify magnitude against recorded
   partials.** When a close order is in flight, any broker quantity smaller
   than expected is accepted as "explained by that order" without checking
@@ -306,12 +306,12 @@ concerns — see git history / review notes for how each was verified.
   account or symbol.** Two processes with different `BOT_DB_PATH` values can
   trade the identical Alpaca account and symbol with no protection from this
   mechanism at all.
-- **`close_position()` closes the entire position, always.** There is no
-  `qty`/`percentage` override anywhere in this codebase. If shares in the
-  traded symbol exist outside the bot's own tracked quantity, closing the
-  position sells all of them — this is exactly what the quantity-mismatch
-  guard above exists to catch, but it's the underlying reason that guard is
-  necessary rather than optional.
+- **A close sells the whole broker position for the symbol.** The exit order
+  is sized from the live position, not from the bot's tracked quantity, so
+  shares held in the same symbol outside the bot would be sold along with the
+  bot's own. This is exactly what the quantity-mismatch guard above exists to
+  catch before it can happen, and it's the reason that guard is necessary
+  rather than optional.
 - **`position_mismatch` is not exposed on the web dashboard**, only via
   `--status` and the events log (see **Dashboard**, above).
 - **The lock file (`<db_path>.lock`) is not covered by `.gitignore`.** The

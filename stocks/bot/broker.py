@@ -130,15 +130,25 @@ class Broker:
             for o in self.trading.get_orders(filter=req)
         ]
 
-    def submit_market_order(self, symbol: str, side: str, qty: float) -> dict:
+    def submit_market_order(self, symbol: str, side: str, qty: float,
+                            client_order_id: str | None = None) -> dict:
+        """Submits a market order. Raises if the submission is not accepted.
+
+        `client_order_id` is an idempotency key the caller owns. Alpaca stores
+        it on the order, so a caller that persisted the id before calling this
+        can find the order again with `get_order_by_client_id` even when the
+        response to this request is lost.
+        """
         req = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
         )
         order = self.trading.submit_order(order_data=req)
-        log.info("Submitted %s %s x%s -> order %s", side, symbol, qty, order.id)
+        log.info("Submitted %s %s x%s (%s) -> order %s",
+                 side, symbol, qty, client_order_id or "no client id", order.id)
         return {
             "id": str(order.id),
             "symbol": order.symbol,
@@ -146,14 +156,6 @@ class Broker:
             "qty": float(order.qty or qty),
             "status": str(getattr(order.status, "value", order.status)),
         }
-
-    def close_position(self, symbol: str) -> dict | None:
-        try:
-            order = self.trading.close_position(symbol)
-        except Exception as exc:
-            log.error("Failed to close %s: %s", symbol, exc)
-            return None
-        return {"id": str(order.id), "status": str(getattr(order.status, "value", order.status))}
 
     def cancel_open_orders(self, symbol: str) -> int:
         cancelled = 0
@@ -236,6 +238,16 @@ class Broker:
         s = status.lower()
         return s not in cls.FILLED and s not in cls.DEAD
 
+    @staticmethod
+    def _order_dict(o) -> dict:
+        return {
+            "id": str(o.id),
+            "client_order_id": str(getattr(o, "client_order_id", "") or "") or None,
+            "status": str(getattr(o.status, "value", o.status)),
+            "filled_qty": float(o.filled_qty or 0),
+            "filled_avg_price": float(o.filled_avg_price or 0) or None,
+        }
+
     def get_order(self, order_id: str) -> dict | None:
         """The order, or None only when Alpaca says it does not exist (404).
 
@@ -254,12 +266,27 @@ class Broker:
         except Exception as exc:
             log.error("Order %s status unreadable (%s).", order_id, exc)
             raise
-        return {
-            "id": str(o.id),
-            "status": str(getattr(o.status, "value", o.status)),
-            "filled_qty": float(o.filled_qty or 0),
-            "filled_avg_price": float(o.filled_avg_price or 0) or None,
-        }
+        return self._order_dict(o)
+
+    def get_order_by_client_id(self, client_order_id: str) -> dict | None:
+        """The order carrying this client id, or None if Alpaca has none.
+
+        None is the answer to "did my submission land?" — and only a 404 may
+        produce it. Anything else is re-raised, because an unreadable broker
+        must never be mistaken for a submission that never arrived.
+        """
+        try:
+            o = self.trading.get_order_by_client_id(client_order_id)
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                log.info("No order exists for client id %s.", client_order_id)
+                return None
+            log.error("Client id %s unreadable (%s).", client_order_id, exc)
+            raise
+        except Exception as exc:
+            log.error("Client id %s unreadable (%s).", client_order_id, exc)
+            raise
+        return self._order_dict(o)
 
     def wait_for_fill(self, order_id: str, timeout: float = 20.0,
                       interval: float = 1.0) -> dict | None:

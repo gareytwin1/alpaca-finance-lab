@@ -448,16 +448,21 @@ class TestExitLifecycle(unittest.TestCase):
         # real status vocabulary, mocked transport
         b.FILLED, b.DEAD = Broker.FILLED, Broker.DEAD
         b.is_working = Broker.is_working
-        b.close_position.return_value = {"id": "ord-1", "status": "pending_new"}
+        b.submit_market_order.return_value = {"id": "ord-1", "status": "pending_new"}
+        b.position.return_value = {"symbol": "SPY", "qty": 10.0, "side": "long",
+                                   "avg_entry_price": 100.0, "current_price": 99.0,
+                                   "market_value": 990.0, "unrealized_pl": -10.0,
+                                   "unrealized_plpc": -1.0}
         b.cancel_open_orders.return_value = 0
         if wait_raises is not None:
             b.wait_for_fill.side_effect = wait_raises
         else:
             b.wait_for_fill.return_value = wait_result
         if get_order is not None:
-            b.get_order.side_effect = get_order if callable(get_order) else None
+            b.get_order_by_client_id.side_effect = (
+                get_order if callable(get_order) else None)
             if not callable(get_order):
-                b.get_order.return_value = get_order
+                b.get_order_by_client_id.return_value = get_order
         bot.broker = b
         return bot
 
@@ -562,8 +567,31 @@ class TestExitLifecycle(unittest.TestCase):
 
     def test_close_submission_failure_does_not_close(self):
         bot = self._bot(wait_result=self._order("filled", 10, 110.0))
-        bot.broker.close_position.return_value = None
+        bot.broker.submit_market_order.side_effect = ConnectionError("network down")
         self._assert_still_open(bot._exit(self._trade(), "stop", 99.0))
+
+    def test_unreadable_position_does_not_submit_a_close(self):
+        """Sizing a close against an unknown position is not allowed."""
+        bot = self._bot(wait_result=self._order("filled", 10, 110.0))
+        bot.broker.position.side_effect = TimeoutError("timed out")
+        self._assert_still_open(bot._exit(self._trade(), "stop", 99.0))
+        bot.broker.submit_market_order.assert_not_called()
+
+    def test_vanished_position_does_not_submit_a_close(self):
+        bot = self._bot(wait_result=self._order("filled", 10, 110.0))
+        bot.broker.position.return_value = None
+        self._assert_still_open(bot._exit(self._trade(), "stop", 99.0))
+        bot.broker.submit_market_order.assert_not_called()
+
+    def test_close_is_sized_from_the_live_position(self):
+        """The ledger quantity is not what gets sold — the broker's is."""
+        bot = self._bot(wait_result=self._order("filled", 6, 110.0))
+        bot.broker.position.return_value = dict(bot.broker.position.return_value,
+                                                qty=6.0)
+        bot._exit(self._trade(), "stop", 99.0)
+        _, kwargs = bot.broker.submit_market_order.call_args
+        args, _ = bot.broker.submit_market_order.call_args
+        self.assertEqual(args[2], 6.0, "sold the ledger quantity, not the broker's")
 
     # -- no duplicate close orders ---------------------------------------
 
@@ -571,12 +599,12 @@ class TestExitLifecycle(unittest.TestCase):
         bot = self._bot(wait_result=self._order("new"))
         trade = self._trade()
         bot._exit(trade, "stop", 99.0)                 # submits ord-1, stays 'new'
-        self.assertEqual(bot.broker.close_position.call_count, 1)
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1)
 
-        bot.broker.get_order.return_value = self._order("new")
+        bot.broker.get_order_by_client_id.return_value = self._order("new")
         res = bot._exit(self._trade(), "stop", 98.0)   # next cycle
         self.assertEqual(res["action"], "exit-pending")
-        self.assertEqual(bot.broker.close_position.call_count, 1,
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1,
                          "a second close order was sent while one was working")
         self.assertIsNotNone(self._trade())
 
@@ -585,7 +613,7 @@ class TestExitLifecycle(unittest.TestCase):
         bot._exit(self._trade(), "trailing stop", 99.0)
         self.assertIsNotNone(self._trade())
 
-        bot.broker.get_order.return_value = self._order("filled", 10, 96.0)
+        bot.broker.get_order_by_client_id.return_value = self._order("filled", 10, 96.0)
         res = bot._exit(self._trade(), "ignored", 99.0)
         self.assertEqual(res["action"], "sell")
         self.assertAlmostEqual(res["fill_price"], 96.0)
@@ -593,27 +621,27 @@ class TestExitLifecycle(unittest.TestCase):
         # the original reason is preserved across the retry
         self.assertEqual(storage.recent_trades(1, path=self.db)[0]["exit_reason"],
                          "trailing stop")
-        self.assertEqual(bot.broker.close_position.call_count, 1)
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1)
 
     def test_dead_pending_exit_is_resubmitted(self):
         bot = self._bot(wait_result=self._order("new"))
         bot._exit(self._trade(), "stop", 99.0)
-        self.assertEqual(bot.broker.close_position.call_count, 1)
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1)
 
-        bot.broker.get_order.return_value = self._order("canceled")
+        bot.broker.get_order_by_client_id.return_value = self._order("canceled")
         bot.broker.wait_for_fill.return_value = self._order("filled", 10, 95.0)
         res = bot._exit(self._trade(), "stop", 99.0)
         self.assertEqual(res["action"], "sell")
-        self.assertEqual(bot.broker.close_position.call_count, 2,
+        self.assertEqual(bot.broker.submit_market_order.call_count, 2,
                          "a dead close order should be replaced")
 
     def test_unreadable_pending_exit_does_not_resubmit(self):
         bot = self._bot(wait_result=self._order("new"))
         bot._exit(self._trade(), "stop", 99.0)
-        bot.broker.get_order.side_effect = TimeoutError("timed out")
+        bot.broker.get_order_by_client_id.side_effect = TimeoutError("timed out")
         res = bot._exit(self._trade(), "stop", 99.0)
         self._assert_still_open(res)
-        self.assertEqual(bot.broker.close_position.call_count, 1,
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1,
                          "resubmitted while the earlier order's fate was unknown")
 
     def test_dry_run_never_touches_the_ledger(self):
@@ -623,7 +651,96 @@ class TestExitLifecycle(unittest.TestCase):
         res = bot._exit(self._trade(), "stop", 99.0)
         self.assertEqual(res["action"], "dry-run-sell")
         self.assertIsNotNone(self._trade())
-        bot.broker.close_position.assert_not_called()
+        bot.broker.submit_market_order.assert_not_called()
+
+    # -- ambiguous submission --------------------------------------------
+
+    def test_client_order_id_is_persisted_before_submitting(self):
+        """The id must survive a lost response, so it is written first."""
+        bot = self._bot(wait_result=self._order("new"))
+        seen = {}
+
+        def capture(*args, **kwargs):
+            seen["pending"] = storage.get_state("pending_exit", path=self.db)
+            return {"id": "ord-1", "status": "pending_new"}
+
+        bot.broker.submit_market_order.side_effect = capture
+        bot._exit(self._trade(), "stop", 99.0)
+
+        self.assertIsNotNone(seen["pending"], "nothing was persisted before the call")
+        self.assertEqual(seen["pending"]["client_order_id"],
+                         f"bot-exit-{self.trade_id}-1")
+        _, kwargs = bot.broker.submit_market_order.call_args
+        self.assertEqual(kwargs["client_order_id"], f"bot-exit-{self.trade_id}-1")
+
+    def test_lost_response_is_resolved_by_client_id(self):
+        """Alpaca accepted the close; the response never arrived."""
+        bot = self._bot(wait_result=self._order("new"))
+        bot.broker.submit_market_order.side_effect = ConnectionError("response lost")
+        first = bot._exit(self._trade(), "stop", 99.0)
+        self._assert_still_open(first)
+
+        # next cycle: the order was there all along, and it filled
+        bot.broker.get_order_by_client_id.return_value = self._order(
+            "filled", 10, 97.0)
+        second = bot._exit(self._trade(), "stop", 99.0)
+
+        self.assertEqual(second["action"], "sell")
+        self.assertAlmostEqual(second["fill_price"], 97.0)
+        self.assertIsNone(self._trade())
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1,
+                         "resubmitted despite the first close having filled")
+
+    def test_submission_that_never_landed_reuses_the_same_id(self):
+        bot = self._bot(wait_result=self._order("new"))
+        bot.broker.submit_market_order.side_effect = ConnectionError("no route")
+        bot._exit(self._trade(), "stop", 99.0)
+
+        # Alpaca has no such order, so it never arrived
+        bot.broker.get_order_by_client_id.return_value = None
+        bot.broker.submit_market_order.side_effect = None
+        bot.broker.submit_market_order.return_value = {"id": "ord-1",
+                                                       "status": "pending_new"}
+        bot._exit(self._trade(), "stop", 99.0)
+
+        _, kwargs = bot.broker.submit_market_order.call_args
+        self.assertEqual(kwargs["client_order_id"], f"bot-exit-{self.trade_id}-1",
+                         "a fresh id was minted for an order that never existed")
+
+    def test_unreadable_client_id_does_not_resubmit(self):
+        """Not knowing whether the close exists must not mean sending another."""
+        bot = self._bot(wait_result=self._order("new"))
+        bot._exit(self._trade(), "stop", 99.0)
+        bot.broker.get_order_by_client_id.side_effect = TimeoutError("timed out")
+        res = bot._exit(self._trade(), "stop", 99.0)
+        self._assert_still_open(res)
+        self.assertEqual(bot.broker.submit_market_order.call_count, 1)
+
+    def test_replacement_after_a_dead_order_uses_a_new_id(self):
+        bot = self._bot(wait_result=self._order("new"))
+        bot._exit(self._trade(), "stop", 99.0)
+
+        bot.broker.get_order_by_client_id.return_value = self._order("canceled")
+        bot.broker.wait_for_fill.return_value = self._order("filled", 10, 95.0)
+        bot._exit(self._trade(), "stop", 99.0)
+
+        _, kwargs = bot.broker.submit_market_order.call_args
+        self.assertEqual(kwargs["client_order_id"], f"bot-exit-{self.trade_id}-2",
+                         "a dead order's id was reused, which Alpaca rejects")
+
+    def test_legacy_pending_exit_without_a_client_id_is_resolved(self):
+        """A record written before exits carried client ids still blocks."""
+        bot = self._bot(wait_result=self._order("new"))
+        storage.set_state("pending_exit",
+                          {"trade_id": self.trade_id, "order_id": "old-ord",
+                           "reason": "stop"}, path=self.db)
+        bot.broker.get_order.return_value = self._order("new", oid="old-ord")
+
+        res = bot._exit(self._trade(), "stop", 99.0)
+
+        self.assertEqual(res["action"], "exit-pending")
+        bot.broker.get_order.assert_called_once_with("old-ord")
+        bot.broker.submit_market_order.assert_not_called()
 
 
 class TestPartialExitAccounting(unittest.TestCase):
@@ -642,7 +759,7 @@ class TestPartialExitAccounting(unittest.TestCase):
         for suffix in ("", "-wal", "-shm"):
             Path(self.db + suffix).unlink(missing_ok=True)
 
-    def _bot(self):
+    def _bot(self, position_qty=10.0):
         from bot.broker import Broker
         from bot.runner import TradingBot
 
@@ -653,8 +770,16 @@ class TestPartialExitAccounting(unittest.TestCase):
         b.FILLED, b.DEAD = Broker.FILLED, Broker.DEAD
         b.is_working = Broker.is_working
         b.cancel_open_orders.return_value = 0
+        b.position.return_value = self._position(position_qty)
         bot.broker = b
         return bot
+
+    @staticmethod
+    def _position(qty):
+        return {"symbol": "SPY", "qty": qty, "side": "long",
+                "avg_entry_price": 700.0, "current_price": 750.0,
+                "market_value": qty * 750.0, "unrealized_pl": 0.0,
+                "unrealized_plpc": 0.0}
 
     @staticmethod
     def _order(status, filled_qty=0, avg=None, oid="ord-1"):
@@ -667,7 +792,7 @@ class TestPartialExitAccounting(unittest.TestCase):
     def test_partial_fill_survives_a_dead_order(self):
         """10 @ 700 exits as 4 @ 750 then 6 @ 752: P&L is 512, not 520."""
         bot = self._bot()
-        bot.broker.close_position.side_effect = [
+        bot.broker.submit_market_order.side_effect = [
             {"id": "ord-1", "status": "pending_new"},
             {"id": "ord-2", "status": "pending_new"},
         ]
@@ -679,15 +804,18 @@ class TestPartialExitAccounting(unittest.TestCase):
         self.assertEqual(first["action"], "exit-unconfirmed")
         self.assertIsNotNone(self._trade())
 
-        # cycle 2: that order is canceled with its 4 shares gone, and the
-        # replacement fills the remaining 6
-        bot.broker.get_order.return_value = self._order("canceled", 4, 750.0)
+        # cycle 2: that order is canceled with its 4 shares gone, so the
+        # broker is down to 6, and the replacement fills those
+        bot.broker.get_order_by_client_id.return_value = self._order("canceled", 4, 750.0)
+        bot.broker.position.return_value = self._position(6.0)
         bot.broker.wait_for_fill.return_value = self._order(
             "filled", 6, 752.0, oid="ord-2")
         second = bot._exit(self._trade(), "stop loss", 751.0)
 
         self.assertEqual(second["action"], "sell")
-        self.assertEqual(bot.broker.close_position.call_count, 2)
+        self.assertEqual(bot.broker.submit_market_order.call_count, 2)
+        # the replacement covers the remaining 6, not the original 10
+        self.assertEqual(bot.broker.submit_market_order.call_args[0][2], 6.0)
         self.assertIsNone(self._trade())
 
         row = storage.recent_trades(1, path=self.db)[0]
@@ -699,8 +827,8 @@ class TestPartialExitAccounting(unittest.TestCase):
 
     def test_partial_fill_is_recorded_once_across_retries(self):
         bot = self._bot()
-        bot.broker.close_position.return_value = {"id": "ord-1",
-                                                  "status": "pending_new"}
+        bot.broker.submit_market_order.return_value = {"id": "ord-1",
+                                                      "status": "pending_new"}
         bot.broker.wait_for_fill.return_value = self._order("new")
         bot._exit(self._trade(), "stop", 99.0)
 
@@ -794,7 +922,7 @@ class TestPositionReconciliation(unittest.TestCase):
     def test_extra_broker_shares_block_trading(self):
         bot = self._bot()
         trade, note = bot.reconcile(self._pos(15), self._trade(), 750.0)
-        self.assertIsNone(trade, "close_position would have sold 5 untracked shares")
+        self.assertIsNone(trade, "the close would have sold 5 untracked shares")
         self.assertIn("does not own", note)
 
     def test_missing_broker_shares_block_trading(self):
