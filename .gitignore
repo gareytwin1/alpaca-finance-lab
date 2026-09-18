@@ -201,3 +201,7 @@ cython_debug/
 position.json
 trade_log.csv
 app.log
+
+# Cron credential file for the trading bot (never commit secrets)
+stocks/.env.alpaca
+stocks/cron.log

@@ -356,6 +356,52 @@ Alpaca account and symbol simultaneously with no protection from this
 mechanism. If you run more than one instance, confirm by hand that they are
 never configured to trade the same symbol on the same account.
 
+## Running on a schedule (cron)
+
+The bot is scheduled via the system crontab, not as a long-lived
+`bot.runner` loop. Each trading-hours minute, cron runs `bot.runner --once`
+through `scripts/run_bot_once.sh`, which does one cycle and exits. This
+avoids babysitting a persistent process across sleep/reboot/crash, and it
+composes cleanly with `single_instance()`: if a cycle ever runs long, the
+next minute's invocation just fails closed (exit 2, logged, no action)
+instead of racing it.
+
+```bash
+crontab -l                    # see the installed schedule
+tail -f cron.log              # wrapper-level output (missing env file, etc.)
+tail -f app.log               # the bot's own log — this is the one that matters
+```
+
+Schedule: every minute, 08:30–15:00 **America/Chicago**, Monday–Friday —
+which is 09:30–16:00 **America/New_York**, the regular session. The two
+zones stay exactly 1 hour apart year-round because both observe US DST on
+the same dates, so this mapping does not need revisiting at DST changeovers.
+If the bot ever runs from a host in a different timezone, recompute the
+cron hours rather than reusing them as-is.
+
+Credentials live in `stocks/.env.alpaca` (mode `600`, gitignored, sourced
+only by the wrapper script) because cron does not run your shell's rc files,
+so `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`/`ALPACA_BASE_URL` would otherwise be
+unset. If you rotate keys, update that file — exporting them in your shell
+again has no effect on cron.
+
+**Stopping the schedule:**
+
+```bash
+crontab -e     # delete the bot's lines, or:
+crontab -r     # removes ALL cron jobs for this user — only if the bot's
+               # entries are the only ones present
+```
+
+Removing the crontab entries does not touch an open position — it only
+stops new cycles from running. Check `--status` and close manually if
+needed.
+
+**A crontab-scheduled cycle uses the same code path as manual runs** —
+`--once` takes the lock, runs `run_once()`, and every guard, reconciliation
+rule, and confirmation check described elsewhere in this document applies
+identically. There is nothing schedule-specific about order handling.
+
 ## What this document does not cover
 
 Anything involving live (non-paper) trading — this bot refuses to start
